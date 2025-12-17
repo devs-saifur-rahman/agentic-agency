@@ -1,28 +1,72 @@
 from __future__ import annotations
+
 import json
-from typing import Any, Literal
 import time
-from app.tools.web_search import web_search
+from typing import Any, Literal, Optional
+import concurrent.futures
+import os
 
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 from app.llm.base import LLMProvider
 from app.state import AgentState, Route
+from app.tools.web_search import web_search
+
+
+# ---------- JSON parsing helpers (robust against minor model formatting) ----------
+def _extract_json_object(text: str) -> str | None:
+    """Return substring from first '{' to last '}' inclusive, else None."""
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start:end+1]
+
+
+def _try_parse_json(text: str) -> dict | None:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _repair_json_with_llm(raw_text: str, llm: LLMProvider) -> str:
+    """Ask model to output ONLY valid JSON, no extra text."""
+    fixer_system = (
+        "You are a strict JSON repair assistant. "
+        "Given malformed/extra-text output, return ONLY a valid JSON object "
+        "with no markdown, no commentary, no trailing text."
+    )
+    messages = [
+        SystemMessage(content=fixer_system),
+        HumanMessage(content=raw_text),
+    ]
+    return llm.invoke(messages)
+
+DEFAULT_LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "45"))
+
+def _invoke_with_timeout(llm: LLMProvider, messages, timeout_s: int = DEFAULT_LLM_TIMEOUT_S) -> str:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(llm.invoke, messages)
+        return fut.result(timeout=timeout_s)
 
 # ---------- Event emission (progress + token streaming) ----------
-def emit_progress(config: dict | None, msg: str) -> None:
+def emit_progress(config: RunnableConfig | None, msg: str) -> None:
     emitter = (config or {}).get("configurable", {}).get("emit")
     if callable(emitter):
         emitter({"type": "progress", "message": msg})
 
-def emit_token(config: dict | None, token: str) -> None:
+def emit_token(config: RunnableConfig | None, token: str) -> None:
     emitter = (config or {}).get("configurable", {}).get("emit")
     if callable(emitter):
         emitter({"type": "token", "text": token})
 
 
-def plan_search(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
+def plan_search(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Planning web search query...")
     state["needs_search"] = True
     state.setdefault("retry_count", 0)
@@ -33,10 +77,40 @@ def plan_search(state: AgentState, llm: LLMProvider, config: dict | None = None)
         SystemMessage(content=PLAN_SEARCH_SYSTEM),
         HumanMessage(content=state["user_query"].strip()),
     ]
-    raw = llm.invoke(messages)
+    # Use timeout to prevent hanging (common with local models)
+    try:
+        raw = _invoke_with_timeout(llm, messages)
+    except concurrent.futures.TimeoutError:
+        state.setdefault("errors", []).append({
+            "node": "plan_search",
+            "message": f"LLM invoke timed out after {DEFAULT_LLM_TIMEOUT_S}s",
+            "recoverable": True,
+        })
+        # Fallback: build a simple direct query
+        state["search_query"] = f"{state['user_query'].strip()} football result"
+        return state
+    
+    # 1) direct parse
+    data = _try_parse_json(raw)
+
+    # 2) try extracting the first {...} block
+    if data is None:
+        candidate = _extract_json_object(raw)
+        if candidate:
+            data = _try_parse_json(candidate)
+
+    # 3) one repair attempt via model
+    if data is None:
+        repaired = _repair_json_with_llm(raw, llm)
+        data = _try_parse_json(repaired)
+        if data is None:
+            candidate = _extract_json_object(repaired) if repaired else None
+            if candidate:
+                data = _try_parse_json(candidate)
 
     try:
-        data = json.loads(raw)
+        if data is None:
+            raise json.JSONDecodeError("Could not parse JSON", raw, 0)
         plan = SearchPlan.model_validate(data)
         state["search_query"] = plan.search_query
         return state
@@ -83,7 +157,7 @@ Rules:
 - No tool names. JSON only.
 """
 
-def reformulate_search(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
+def reformulate_search(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Reformulating search query (one last try)...")
     state["reformulate_count"] = int(state.get("reformulate_count", 0)) + 1
 
@@ -100,12 +174,12 @@ def reformulate_search(state: AgentState, llm: LLMProvider, config: dict | None 
         # fallback slight tweak
         state["search_query"] = f'{state["user_query"].strip()} match report score scorers'
     return state
-def search_web(state: AgentState, config: dict | None = None) -> AgentState:
+def search_web(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     q = state.get("search_query", "").strip()
     emit_progress(config, f"Searching web: {q!r}")
 
     try:
-        results = web_search(q, max_results=6)
+        results = web_search(q, max_results=8)        
         state["search_results"] = results
         return state
     except Exception as e:
@@ -116,7 +190,7 @@ def search_web(state: AgentState, config: dict | None = None) -> AgentState:
         state["search_results"] = None
         return state
 
-def ingest_user(state: AgentState, config: dict | None = None) -> AgentState:
+def ingest_user(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Ingesting user message...")
     state.setdefault("messages", [])
     state["messages"].append({"role": "user", "content": state["user_query"]})
@@ -124,7 +198,7 @@ def ingest_user(state: AgentState, config: dict | None = None) -> AgentState:
     return state
 
 
-def route_guard(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
+def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Routing request (scope/command detection)...")
     user_text = state["user_query"].strip()
 
@@ -156,10 +230,39 @@ def route_guard(state: AgentState, llm: LLMProvider, config: dict | None = None)
         SystemMessage(content=ROUTER_SYSTEM),
         HumanMessage(content=user_text),
     ]
-    raw = llm.invoke(messages)
+    # Use timeout to prevent hanging (common with local models)
+    try:
+        raw = _invoke_with_timeout(llm, messages)
+    except concurrent.futures.TimeoutError:
+        state.setdefault("errors", []).append({
+            "node": "route_guard",
+            "message": f"LLM invoke timed out after {DEFAULT_LLM_TIMEOUT_S}s",
+            "recoverable": True,
+        })
+        state["route"] = "OUT_OF_SCOPE"
+        state["command"] = None
+        state["command_args"] = {}
+        return state
+
+    # Robust JSON parse
+    data = _try_parse_json(raw)
+
+    if data is None:
+        candidate = _extract_json_object(raw)
+        if candidate:
+            data = _try_parse_json(candidate)
+
+    if data is None:
+        repaired = _repair_json_with_llm(raw, llm)
+        data = _try_parse_json(repaired)
+        if data is None:
+            candidate = _extract_json_object(repaired) if repaired else None
+            if candidate:
+                data = _try_parse_json(candidate)
 
     try:
-        data = json.loads(raw)
+        if data is None:
+            raise json.JSONDecodeError("Could not parse JSON", raw, 0)
         decision = RouteDecision.model_validate(data)
         state["route"] = decision.route
         state["command"] = decision.command
@@ -167,14 +270,19 @@ def route_guard(state: AgentState, llm: LLMProvider, config: dict | None = None)
         return state
     except (json.JSONDecodeError, ValidationError) as e:
         # Safe fallback: if router fails, refuse (prevents scope leakage)
-        state.setdefault("errors", []).append({"node": "route_guard", "message": str(e), "recoverable": True})
+        preview = (raw or "").replace("\n", " ")[:300]
+        state.setdefault("errors", []).append({
+            "node": "route_guard",
+            "message": f"{str(e)} | raw_preview={preview}",
+            "recoverable": True,
+        })
         state["route"] = "OUT_OF_SCOPE"
         state["command"] = None
         state["command_args"] = {}
         return state
 
 
-def handle_command(state: AgentState, config: dict | None = None) -> AgentState:
+def handle_command(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Handling command...")
     cmd = state.get("command")
     args = state.get("command_args", {})
@@ -194,7 +302,7 @@ def handle_command(state: AgentState, config: dict | None = None) -> AgentState:
     return state
 
 
-def refuse(state: AgentState, config: dict | None = None) -> AgentState:
+def refuse(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Refusing (out of scope)...")
     state["final_answer"] = (
         "I can only answer questions about **football match scores/results** (opponent, scoreline, scorers, last/previous match, head-to-head results). "
@@ -203,27 +311,26 @@ def refuse(state: AgentState, config: dict | None = None) -> AgentState:
     return state
 
 
-ANSWER_SYSTEM = """You answer ONLY football score/result questions using the provided WEB SEARCH RESULTS.
+ANSWER_SYSTEM = """You answer ONLY football score/result questions using the PROVIDED MATCH FACTS.
 Rules:
-- Use ONLY the provided results (snippets + URLs). Do not use prior knowledge.
-- If evidence is insufficient or conflicting, ask a clarifying question.
-- Always include 1–3 citations as plain URLs at the end under 'Sources:'.
-- If out of scope, refuse briefly.
+- Use ONLY the provided facts and their source_url.
+- If facts are insufficient, ask a clarifying question (do not guess).
+- Keep it concise.
+- End with 'Sources:' and include 1–3 URLs.
 """
 
+def write_answer(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
+    emit_progress(config, "Writing answer from extracted facts (streaming)...")
 
-def write_answer(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
-    emit_progress(config, "Generating final answer from web evidence (streaming)...")
-    user_text = state["user_query"].strip()
-    results = state.get("search_results") or []
+    facts = state.get("extracted_facts") or []
+    selected = state.get("selected_fact")
+    facts_to_use = [selected] if selected else facts[:2]
 
-    evidence_block = "\n".join(
-        [f"- Title: {r['title']}\n  URL: {r['url']}\n  Snippet: {r['snippet']}" for r in results[:6]]
-    ) or "NO_RESULTS"
+    fact_block = "\n".join([json.dumps(f, ensure_ascii=False) for f in facts_to_use if f]) or "NO_FACTS"
 
     messages = [
         SystemMessage(content=ANSWER_SYSTEM),
-        HumanMessage(content=f"Question: {user_text}\n\nWEB SEARCH RESULTS:\n{evidence_block}"),
+        HumanMessage(content=f"Question: {state['user_query']}\n\nMATCH FACTS:\n{fact_block}"),
     ]
 
     out = []
@@ -232,8 +339,19 @@ def write_answer(state: AgentState, llm: LLMProvider, config: dict | None = None
         out.append(tok)
 
     state["final_answer"] = "".join(out).strip()
-    # store citations as the URLs we provided (not perfect, but ok for Slice 2)
-    state["citations"] = [r["url"] for r in results[:3]]
+
+    # citations from fact source_url (dedupe)
+    urls = []
+    seen = set()
+    for f in facts_to_use:
+        if not f:
+            continue
+        u = f.get("source_url")
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+    state["citations"] = urls[:3]
+
     return state
 
 
@@ -246,6 +364,33 @@ def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "
         return "refuse"
     return "plan_search"
 
+def next_after_extract_Debug(state: AgentState) -> Literal["clarify_ambiguity", "write_answer"]:
+    nxt = "write_answer"
+    facts = state.get("extracted_facts") or []
+    if not facts or state.get("ambiguous") is True or (state.get("confidence") in ("low", "medium") and state.get("selected_fact") is None):
+        nxt = "clarify_ambiguity"
+    print("DEBUG next_after_extract:", nxt, "| facts:", len(facts), "| amb:", state.get("ambiguous"), "| conf:", state.get("confidence"))
+    return nxt
+
+
+def next_after_extract(state: AgentState) -> Literal["clarify_ambiguity", "write_answer"]:
+    facts = state.get("extracted_facts") or []
+    if not facts:
+        return "clarify_ambiguity"
+
+    if state.get("ambiguous") is True:
+        return "clarify_ambiguity"
+
+    f = state.get("selected_fact") or facts[0]
+
+    has_teams = bool(f.get("home_team")) and bool(f.get("away_team"))
+    has_score = bool(f.get("score"))
+    has_source = bool(f.get("source_url"))
+
+    if has_teams and has_score and has_source:
+        return "write_answer"
+
+    return "clarify_ambiguity"
 
 def need_retry_search(state: AgentState) -> bool:
     # tool error occurred if search_results missing AND retry_count incremented
@@ -261,6 +406,52 @@ def can_reformulate(state: AgentState) -> bool:
 class SearchPlan(BaseModel):
     search_query: str = Field(min_length=3)
 
+class MatchFact(BaseModel):
+    date: Optional[str] = None              # ISO if possible, else null
+    competition: Optional[str] = None
+    home_team: Optional[str] = None
+    away_team: Optional[str] = None
+    score: Optional[str] = None             # e.g., "2-1"
+    scorers: list[str] = Field(default_factory=list)
+    source_url: str
+
+class ExtractOutput(BaseModel):
+    candidates: list[MatchFact] = Field(default_factory=list)
+    ambiguous: bool
+    confidence: Literal["low", "medium", "high"]
+    missing_fields: list[str] = Field(default_factory=list)
+    selected_index: Optional[int] = None
+
+EXTRACT_SYSTEM = """You extract football match RESULT facts from WEB SEARCH RESULTS.
+
+You MUST:
+- Use ONLY the provided results (title/snippet/url).
+- Output JSON matching this schema:
+{
+  "candidates": [
+    {
+      "date": "YYYY-MM-DD" or null,
+      "competition": "..." or null,
+      "home_team": "..." or null,
+      "away_team": "..." or null,
+      "score": "X-Y" or null,
+      "scorers": ["..."],
+      "source_url": "https://..."
+    }
+  ],
+  "ambiguous": true/false,
+  "confidence": "low"|"medium"|"high",
+  "missing_fields": ["..."],
+  "selected_index": 0 or null
+}
+
+Rules:
+- Create 1 candidate per distinct match you can identify.
+- If multiple different matches appear, set ambiguous=true unless the user clearly asked for multiple.
+- Choose selected_index only when confidence is high and the user's question clearly points to one match.
+- No extra keys. JSON only.
+"""
+
 PLAN_SEARCH_SYSTEM = """You create a web search query to answer football SCORE/RESULT questions.
 Return ONLY JSON:
 { "search_query": "..." }
@@ -271,27 +462,130 @@ Rules:
 - No tool names. JSON only.
 """
 
-def next_after_search(state: AgentState) -> Literal["search_web", "reformulate_search", "no_results_clarify", "write_answer"]:
+
+def next_after_search(state: AgentState) -> Literal["search_web", "reformulate_search", "extract_facts"]:
     if need_retry_search(state):
         return "search_web"
-
-    if search_results_empty(state):
-        if can_reformulate(state):
-            return "reformulate_search"
-        return "no_results_clarify"
-
-    return "write_answer"
+    if search_results_empty(state) and can_reformulate(state):
+        return "reformulate_search"
+    return "extract_facts"
 
 
 
-def no_results_clarify(state: AgentState, config: dict | None = None) -> AgentState:
-    emit_progress(config, "No search results; asking user to clarify...")
-    state["final_answer"] = (
-        "I couldn't find reliable web results for that query.\n"
-        "Please clarify one of these so I can search again:\n"
-        "- competition (La Liga / UCL / Copa del Rey)\n"
-        "- approximate date (e.g., Nov 2025)\n"
-        "- opponent name\n"
+# def no_results_clarify(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
+#     emit_progress(config, "No search results; asking user to clarify...")
+#     state["final_answer"] = (
+#         "I couldn't find reliable web results for that query.\n"
+#         "Please clarify one of these so I can search again:\n"
+#         "- competition (La Liga / UCL / Copa del Rey)\n"
+#         "- approximate date (e.g., Nov 2025)\n"
+#         "- opponent name\n"
+#     )
+#     state["citations"] = []
+#     return state
+
+def clarify_ambiguity(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
+    emit_progress(config, "Ambiguous results; asking user to disambiguate...")
+
+    cands = state.get("extracted_facts") or []
+    lines = []
+    for i, c in enumerate(cands[:4], start=1):
+        ht = c.get("home_team") or "?"
+        at = c.get("away_team") or "?"
+        sc = c.get("score") or "?"
+        dt = c.get("date") or "?"
+        comp = c.get("competition") or "?"
+        lines.append(f"{i}) {ht} vs {at} — {sc} — {comp} — {dt}")
+
+    prompt = (
+        "I found multiple possible matches for your question.\n"
+        "Which one do you mean? Reply with 1/2/3… or tell me the date/competition.\n\n"
+        + ("\n".join(lines) if lines else "No clear candidates were extracted; please specify date/competition/opponent.")
     )
+    state["final_answer"] = prompt
     state["citations"] = []
     return state
+
+
+
+def extract_facts(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
+    emit_progress(config, "Extracting match facts (structured)...")
+
+    results = state.get("search_results") or []
+
+    # Keep evidence smaller to reduce local-model JSON failures/hangs
+    evidence_block = "\n".join(
+        [f"- Title: {r['title']}\n  URL: {r['url']}\n  Snippet: {r['snippet']}" for r in results[:5]]
+    ) or "NO_RESULTS"
+
+    messages = [
+        SystemMessage(content=EXTRACT_SYSTEM),
+        HumanMessage(content=f"User question: {state['user_query']}\n\nWEB SEARCH RESULTS:\n{evidence_block}"),
+    ]
+
+    # 0) Call model with timeout (prevents hangs on local models)
+    try:
+        raw = _invoke_with_timeout(llm, messages)
+    except concurrent.futures.TimeoutError:
+        state.setdefault("errors", []).append({
+            "node": "extract_facts",
+            "message": f"LLM invoke timed out after {DEFAULT_LLM_TIMEOUT_S}s",
+            "recoverable": True,
+        })
+        state["extracted_facts"] = []
+        state["ambiguous"] = True
+        state["confidence"] = "low"
+        state["missing_fields"] = ["score", "teams", "date"]
+        state["selected_fact"] = None
+        return state
+
+    # 1) direct parse
+    data = _try_parse_json(raw)
+
+    # 2) try extracting the first {...} block
+    if data is None:
+        candidate = _extract_json_object(raw)
+        if candidate:
+            data = _try_parse_json(candidate)
+
+    # 3) one repair attempt via model
+    if data is None:
+        repaired = _repair_json_with_llm(raw, llm)
+        data = _try_parse_json(repaired)
+        if data is None:
+            candidate = _extract_json_object(repaired) if repaired else None
+            if candidate:
+                data = _try_parse_json(candidate)
+
+    try:
+        if data is None:
+            raise json.JSONDecodeError("Could not parse JSON", raw, 0)
+
+        out = ExtractOutput.model_validate(data)
+
+        candidates = [c.model_dump() for c in out.candidates]
+        state["extracted_facts"] = candidates
+        state["ambiguous"] = bool(out.ambiguous)
+        state["confidence"] = out.confidence
+        state["missing_fields"] = list(out.missing_fields)
+
+        sel = None
+        if out.selected_index is not None and 0 <= out.selected_index < len(candidates):
+            sel = candidates[out.selected_index]
+        state["selected_fact"] = sel
+
+        return state
+
+    except (json.JSONDecodeError, ValidationError) as e:
+        preview = (raw or "").replace("\n", " ")[:300]
+        state.setdefault("errors", []).append({
+            "node": "extract_facts",
+            "message": f"{str(e)} | raw_preview={preview}",
+            "recoverable": True,
+        })
+        state["extracted_facts"] = []
+        state["ambiguous"] = True
+        state["confidence"] = "low"
+        state["missing_fields"] = ["score", "teams", "date"]
+        state["selected_fact"] = None
+        return state

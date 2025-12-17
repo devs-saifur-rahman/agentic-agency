@@ -6,6 +6,8 @@ from rich.text import Text
 from app.llm.factory import get_llm
 from app.graph.build_graph import build_graph
 from app.state import AgentState
+import traceback
+
 
 console = Console()
 
@@ -29,19 +31,21 @@ def run_once(app, thread_id: str, user_query: str):
     }
 
     # Pass emitter through config (LangGraph-friendly)
-    result = app.invoke(
-        state,
-        config={"configurable": {"emit": emit}},
-    )
-    console.print("")  # newline after token stream
-    return result
+    try:
+        result = app.invoke(state, config={"configurable": {"emit": emit}})
+        console.print("")  # newline after token stream
+        return result
+    except Exception:
+        console.print("\n[bold red]Graph crashed:[/bold red]")
+        console.print(traceback.format_exc())
+        return state
 
 def main():
     llm = get_llm()
     app = build_graph(llm)
 
     thread_id = str(uuid.uuid4())
-    console.print("[bold green]Football Agent (Slice 2)[/bold green]")
+    console.print("[bold green]Football Agent (Slice 3)[/bold green]")
     console.print("Type a question. Commands: /undo N, /rewind ID, /restart. Type 'exit' to quit.\n")
 
     while True:

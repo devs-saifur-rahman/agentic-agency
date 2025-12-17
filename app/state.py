@@ -1,4 +1,4 @@
-from typing import TypedDict, Literal, NotRequired, Any
+from typing import TypedDict, Literal, Any
 
 Route = Literal["COMMAND", "FOOTBALL_SCORES", "OUT_OF_SCOPE"]
 
@@ -28,3 +28,10 @@ class AgentState(TypedDict, total=False):
 
     # ---- Reliability ----
     errors: list[dict[str, Any]]
+    
+    # ---- Extracted facts (Slice 3) ----
+    extracted_facts: list[dict[str, Any]]
+    ambiguous: bool
+    confidence: Literal["low", "medium", "high"]
+    missing_fields: list[str]
+    selected_fact: dict[str, Any] | None
