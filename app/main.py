@@ -41,7 +41,7 @@ def main():
     app = build_graph(llm)
 
     thread_id = str(uuid.uuid4())
-    console.print("[bold green]Football Agent (Slice 1)[/bold green]")
+    console.print("[bold green]Football Agent (Slice 2)[/bold green]")
     console.print("Type a question. Commands: /undo N, /rewind ID, /restart. Type 'exit' to quit.\n")
 
     while True:

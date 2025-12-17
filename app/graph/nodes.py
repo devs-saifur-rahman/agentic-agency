@@ -1,6 +1,8 @@
 from __future__ import annotations
 import json
 from typing import Any, Literal
+import time
+from app.tools.web_search import web_search
 
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -20,6 +22,29 @@ def emit_token(config: dict | None, token: str) -> None:
         emitter({"type": "token", "text": token})
 
 
+def plan_search(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
+    emit_progress(config, "Planning web search query...")
+    state["needs_search"] = True
+    state.setdefault("retry_count", 0)
+    state.setdefault("max_retries", 2)
+    state.setdefault("reformulate_count", 0)
+
+    messages = [
+        SystemMessage(content=PLAN_SEARCH_SYSTEM),
+        HumanMessage(content=state["user_query"].strip()),
+    ]
+    raw = llm.invoke(messages)
+
+    try:
+        data = json.loads(raw)
+        plan = SearchPlan.model_validate(data)
+        state["search_query"] = plan.search_query
+        return state
+    except (json.JSONDecodeError, ValidationError) as e:
+        state.setdefault("errors", []).append({"node": "plan_search", "message": str(e), "recoverable": True})
+        # fallback: simple direct query
+        state["search_query"] = f'{state["user_query"].strip()} football result'
+        return state
 # ---------- Router schema ----------
 class RouteDecision(BaseModel):
     route: Route
@@ -51,7 +76,45 @@ Rules:
 - Do not add any extra keys.
 - No commentary. JSON only.
 """
+REFORMULATE_SYSTEM = """You improve a failing football match-result web search query.
+Return ONLY JSON: { "search_query": "..." }
+Rules:
+- Make it more specific with team names, competition, and keywords: result, score, scorers, match report.
+- No tool names. JSON only.
+"""
 
+def reformulate_search(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
+    emit_progress(config, "Reformulating search query (one last try)...")
+    state["reformulate_count"] = int(state.get("reformulate_count", 0)) + 1
+
+    messages = [
+        SystemMessage(content=REFORMULATE_SYSTEM),
+        HumanMessage(content=f"User question: {state['user_query']}\nPrevious query: {state.get('search_query','')}"),
+    ]
+    raw = llm.invoke(messages)
+    try:
+        data = json.loads(raw)
+        plan = SearchPlan.model_validate(data)
+        state["search_query"] = plan.search_query
+    except Exception:
+        # fallback slight tweak
+        state["search_query"] = f'{state["user_query"].strip()} match report score scorers'
+    return state
+def search_web(state: AgentState, config: dict | None = None) -> AgentState:
+    q = state.get("search_query", "").strip()
+    emit_progress(config, f"Searching web: {q!r}")
+
+    try:
+        results = web_search(q, max_results=6)
+        state["search_results"] = results
+        return state
+    except Exception as e:
+        state.setdefault("errors", []).append({"node": "search_web", "message": str(e), "recoverable": True})
+        state["retry_count"] = int(state.get("retry_count", 0)) + 1
+        # small backoff
+        time.sleep(0.5)
+        state["search_results"] = None
+        return state
 
 def ingest_user(state: AgentState, config: dict | None = None) -> AgentState:
     emit_progress(config, "Ingesting user message...")
@@ -140,39 +203,95 @@ def refuse(state: AgentState, config: dict | None = None) -> AgentState:
     return state
 
 
-ANSWER_SYSTEM = """You answer ONLY football score/result questions.
-- If the question is not about match results/scores/scorers, refuse briefly.
-- If you don't have evidence yet, say you need to search (we'll add search in Slice 2).
-Keep it concise.
+ANSWER_SYSTEM = """You answer ONLY football score/result questions using the provided WEB SEARCH RESULTS.
+Rules:
+- Use ONLY the provided results (snippets + URLs). Do not use prior knowledge.
+- If evidence is insufficient or conflicting, ask a clarifying question.
+- Always include 1–3 citations as plain URLs at the end under 'Sources:'.
+- If out of scope, refuse briefly.
 """
 
 
 def write_answer(state: AgentState, llm: LLMProvider, config: dict | None = None) -> AgentState:
-    emit_progress(config, "Generating final answer (streaming)...")
-
-    # Slice 1: no web search yet. We will be honest.
+    emit_progress(config, "Generating final answer from web evidence (streaming)...")
     user_text = state["user_query"].strip()
+    results = state.get("search_results") or []
+
+    evidence_block = "\n".join(
+        [f"- Title: {r['title']}\n  URL: {r['url']}\n  Snippet: {r['snippet']}" for r in results[:6]]
+    ) or "NO_RESULTS"
 
     messages = [
         SystemMessage(content=ANSWER_SYSTEM),
-        HumanMessage(content=user_text),
+        HumanMessage(content=f"Question: {user_text}\n\nWEB SEARCH RESULTS:\n{evidence_block}"),
     ]
 
-    # Stream tokens to UI/console while building final_answer
     out = []
     for tok in llm.stream(messages):
         emit_token(config, tok)
         out.append(tok)
 
     state["final_answer"] = "".join(out).strip()
+    # store citations as the URLs we provided (not perfect, but ok for Slice 2)
+    state["citations"] = [r["url"] for r in results[:3]]
     return state
 
 
 # --------- Conditional routing helpers (pure functions) ----------
-def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "write_answer"]:
+def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "plan_search"]:
     r = state.get("route")
     if r == "COMMAND":
         return "handle_command"
     if r == "OUT_OF_SCOPE":
         return "refuse"
+    return "plan_search"
+
+
+def need_retry_search(state: AgentState) -> bool:
+    # tool error occurred if search_results missing AND retry_count incremented
+    
+    return (state.get("search_results") is None) and (int(state.get("retry_count", 0)) < int(state.get("max_retries", 2)))
+
+def search_results_empty(state: AgentState) -> bool:
+    return not (state.get("search_results") or [])
+
+def can_reformulate(state: AgentState) -> bool:
+    return int(state.get("reformulate_count", 0)) < 1
+
+class SearchPlan(BaseModel):
+    search_query: str = Field(min_length=3)
+
+PLAN_SEARCH_SYSTEM = """You create a web search query to answer football SCORE/RESULT questions.
+Return ONLY JSON:
+{ "search_query": "..." }
+
+Rules:
+- The query must be specific (team, opponent, match name like El Clasico, and 'result'/'score'/'scorers' if needed).
+- If user asks "previous match / game before that", include 'previous match before last' phrasing.
+- No tool names. JSON only.
+"""
+
+def next_after_search(state: AgentState) -> Literal["search_web", "reformulate_search", "no_results_clarify", "write_answer"]:
+    if need_retry_search(state):
+        return "search_web"
+
+    if search_results_empty(state):
+        if can_reformulate(state):
+            return "reformulate_search"
+        return "no_results_clarify"
+
     return "write_answer"
+
+
+
+def no_results_clarify(state: AgentState, config: dict | None = None) -> AgentState:
+    emit_progress(config, "No search results; asking user to clarify...")
+    state["final_answer"] = (
+        "I couldn't find reliable web results for that query.\n"
+        "Please clarify one of these so I can search again:\n"
+        "- competition (La Liga / UCL / Copa del Rey)\n"
+        "- approximate date (e.g., Nov 2025)\n"
+        "- opponent name\n"
+    )
+    state["citations"] = []
+    return state
