@@ -45,14 +45,25 @@ def _repair_json_with_llm(raw_text: str, llm: LLMProvider) -> str:
         SystemMessage(content=fixer_system),
         HumanMessage(content=raw_text),
     ]
-    return llm.invoke(messages)
+    return _invoke_with_timeout(llm, messages)
 
 DEFAULT_LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "45"))
 
 def _invoke_with_timeout(llm: LLMProvider, messages, timeout_s: int = DEFAULT_LLM_TIMEOUT_S) -> str:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(llm.invoke, messages)
+    """
+    Run llm.invoke in a thread and stop waiting after timeout.
+
+    IMPORTANT: Do NOT use `with ThreadPoolExecutor(...)` because it calls
+    shutdown(wait=True) on exit, which will hang forever if llm.invoke is stuck.
+    """
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(llm.invoke, messages)
+    try:
         return fut.result(timeout=timeout_s)
+    finally:
+        # Don't wait for a stuck thread
+        fut.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
 
 # ---------- Event emission (progress + token streaming) ----------
 def emit_progress(config: RunnableConfig | None, msg: str) -> None:
@@ -86,6 +97,7 @@ def plan_search(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
             "message": f"LLM invoke timed out after {DEFAULT_LLM_TIMEOUT_S}s",
             "recoverable": True,
         })
+        emit_progress(config, f"PlanSearch timed out after {DEFAULT_LLM_TIMEOUT_S}s; using fallback query")
         # Fallback: build a simple direct query
         state["search_query"] = f"{state['user_query'].strip()} football result"
         return state
@@ -239,6 +251,7 @@ def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
             "message": f"LLM invoke timed out after {DEFAULT_LLM_TIMEOUT_S}s",
             "recoverable": True,
         })
+        emit_progress(config, "RouteGuard timed out; falling back to OUT_OF_SCOPE")
         state["route"] = "OUT_OF_SCOPE"
         state["command"] = None
         state["command_args"] = {}
@@ -264,9 +277,17 @@ def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
         if data is None:
             raise json.JSONDecodeError("Could not parse JSON", raw, 0)
         decision = RouteDecision.model_validate(data)
+        # Debug: show router decision
+        emit_progress(config, f"Router raw decision: route={decision.route} command={decision.command} args={decision.command_args}")
         state["route"] = decision.route
         state["command"] = decision.command
         state["command_args"] = decision.command_args
+        # Normalize (defensive) and emit final routing choice
+        if state.get("route") not in ("COMMAND", "FOOTBALL_SCORES", "OUT_OF_SCOPE"):
+            state["route"] = "OUT_OF_SCOPE"
+            state["command"] = None
+            state["command_args"] = {}
+        emit_progress(config, f"RouteGuard decided: {state.get('route')} (command={state.get('command')})")
         return state
     except (json.JSONDecodeError, ValidationError) as e:
         # Safe fallback: if router fails, refuse (prevents scope leakage)
@@ -276,6 +297,7 @@ def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
             "message": f"{str(e)} | raw_preview={preview}",
             "recoverable": True,
         })
+        emit_progress(config, "RouteGuard parse failed; falling back to OUT_OF_SCOPE")
         state["route"] = "OUT_OF_SCOPE"
         state["command"] = None
         state["command_args"] = {}
@@ -537,6 +559,7 @@ def extract_facts(state: AgentState, llm: LLMProvider, config: RunnableConfig | 
         state["confidence"] = "low"
         state["missing_fields"] = ["score", "teams", "date"]
         state["selected_fact"] = None
+        emit_progress(config, f"ExtractFacts timed out after {DEFAULT_LLM_TIMEOUT_S}s; falling back")
         return state
 
     # 1) direct parse

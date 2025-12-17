@@ -21,24 +21,41 @@ def make_emitter():
     return emit
 
 def run_once(app, thread_id: str, user_query: str):
-    emit = make_emitter()
+    saw_token = False
 
-    state: AgentState = {
+    def emit(event: dict):
+        nonlocal saw_token
+        t = event.get("type")
+        if t == "progress":
+            # keep your existing progress printing
+            console.print(f" {event.get('message')}")
+        elif t == "token":
+            saw_token = True
+            # keep your existing token printing
+            console.print(event.get("text", ""), end="")
+
+    state = {
         "thread_id": thread_id,
         "user_query": user_query,
         "messages": [],
         "errors": [],
     }
 
-    # Pass emitter through config (LangGraph-friendly)
-    try:
-        result = app.invoke(state, config={"configurable": {"emit": emit}})
-        console.print("")  # newline after token stream
-        return result
-    except Exception:
-        console.print("\n[bold red]Graph crashed:[/bold red]")
-        console.print(traceback.format_exc())
-        return state
+    result = app.invoke(state, config={"configurable": {"emit": emit}})
+
+    # If nothing was streamed, print final_answer explicitly
+    final_answer = (result or {}).get("final_answer")
+    if (not saw_token) and final_answer:
+        console.print(final_answer)
+
+    # Also print sources for non-streaming answers
+    cites = (result or {}).get("citations") or []
+    if (not saw_token) and cites:
+        console.print("\nSources:")
+        for u in cites[:3]:
+            console.print(u)
+
+    return result
 
 def main():
     llm = get_llm()
