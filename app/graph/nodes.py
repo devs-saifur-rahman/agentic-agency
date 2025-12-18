@@ -8,12 +8,59 @@ import concurrent.futures
 import os
 
 from pydantic import BaseModel, Field, ValidationError
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from app.llm.base import LLMProvider
 from app.state import AgentState, Route
 from app.tools.web_search import web_search
+
+def _as_text(x) -> str:
+    """Normalize LLM outputs (AIMessage/AIMessageChunk/str/etc.) into a plain string."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    # LangChain messages usually have .content
+    if isinstance(x, BaseMessage):
+        return x.content or ""
+    # fallback
+    return str(x)
+
+def _extract_tool_call_ids(ai: AIMessage) -> set[str]:
+    ids: set[str] = set()
+
+    # Preferred: ai.tool_calls (LC)
+    tc = getattr(ai, "tool_calls", None)
+    if tc:
+        for c in tc:
+            if isinstance(c, dict):
+                if c.get("id"):
+                    ids.add(c["id"])
+            else:
+                cid = getattr(c, "id", None)
+                if cid:
+                    ids.add(cid)
+
+    # Fallback: additional_kwargs["tool_calls"]
+    ak = getattr(ai, "additional_kwargs", None) or {}
+    tc2 = ak.get("tool_calls") or []
+    for c in tc2:
+        if isinstance(c, dict) and c.get("id"):
+            ids.add(c["id"])
+
+    return ids
+
+def _sanitize_messages_for_tool_models(msgs):
+    cleaned = []
+    for i, m in enumerate(msgs):
+        if isinstance(m, ToolMessage):
+            # Only keep tool messages if previous message had tool_calls
+            if i > 0 and hasattr(msgs[i-1], "tool_calls"):
+                cleaned.append(m)
+            continue
+        cleaned.append(m)
+    return cleaned
 
 
 # ---------- JSON parsing helpers (robust against minor model formatting) ----------
@@ -26,6 +73,59 @@ def _extract_json_object(text: str) -> str | None:
     if start == -1 or end == -1 or end <= start:
         return None
     return text[start:end+1]
+
+def _as_text(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, BaseMessage):
+        return x.content or ""
+    return str(x)
+
+AGENT_SYSTEM = """You are a football scores assistant.
+You may use tools when needed to answer.
+Only answer football match score/result questions (opponent, scoreline, scorers, last/previous match, head-to-head).
+If the user asks something else, say it's out of scope.
+"""
+
+
+def agent_search(state: AgentState, llm, config=None) -> AgentState:
+    emit_progress(config, "Agent deciding whether to call tools...")
+    
+    if state.get("has_searched"):
+        return state 
+    
+    msgs = state.get("messages") or []
+
+    # 🔍 DEBUG — ADD THESE LINES
+    print("DEBUG message types (before sanitize):",
+          [type(m).__name__ for m in msgs[:12]])
+
+    for m in msgs:
+        if type(m).__name__ in ("AIMessage", "ToolMessage"):
+            print(
+                "DEBUG first tool-ish:",
+                type(m).__name__,
+                "tool_calls=", getattr(m, "tool_calls", None),
+                "tool_call_id=", getattr(m, "tool_call_id", None),
+            )
+            break
+    # 🔍 END DEBUG
+
+    msgs = _sanitize_messages_for_tool_models(state.get("messages", []))
+
+    # ensure system at top (once)
+    if not msgs or not isinstance(msgs[0], SystemMessage):
+        msgs = [SystemMessage(content=AGENT_SYSTEM)] + msgs
+
+    ai_msg = llm.invoke(msgs)
+    state["messages"] = msgs + [ai_msg]
+    state["has_searched"] = True   # ✅ SET FLAG
+    return state
+
+
+
 
 
 def _try_parse_json(text: str) -> dict | None:
@@ -46,25 +146,20 @@ def _repair_json_with_llm(raw_text: str, llm: LLMProvider) -> str:
         SystemMessage(content=fixer_system),
         HumanMessage(content=raw_text),
     ]
-    return _invoke_with_timeout(llm, messages)
+    return _invoke_with_timeout(llm, messages) 
 
 DEFAULT_LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "45"))
 
 def _invoke_with_timeout(llm: LLMProvider, messages, timeout_s: int = DEFAULT_LLM_TIMEOUT_S) -> str:
-    """
-    Run llm.invoke in a thread and stop waiting after timeout.
-
-    IMPORTANT: Do NOT use `with ThreadPoolExecutor(...)` because it calls
-    shutdown(wait=True) on exit, which will hang forever if llm.invoke is stuck.
-    """
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     fut = ex.submit(llm.invoke, messages)
     try:
-        return fut.result(timeout=timeout_s)
+        out = fut.result(timeout=timeout_s)
+        return _as_text(out)   # ✅ normalize AIMessage → str
     finally:
-        # Don't wait for a stuck thread
         fut.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
+
 
 
 def _parse_selection_index(text: str) -> int | None:
@@ -115,7 +210,8 @@ def plan_search(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
     ]
     # Use timeout to prevent hanging (common with local models)
     try:
-        raw = _invoke_with_timeout(llm, messages)
+        msg = _invoke_with_timeout(llm, messages)
+        raw = msg.content if hasattr(msg, "content") else str(msg)
     except concurrent.futures.TimeoutError:
         state.setdefault("errors", []).append({
             "node": "plan_search",
@@ -230,9 +326,10 @@ def search_web(state: AgentState, config: RunnableConfig | None = None) -> Agent
 def ingest_user(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Ingesting user message...")
     state.setdefault("messages", [])
-    state["messages"].append({"role": "user", "content": state["user_query"]})
     state.setdefault("errors", [])
-    return state
+    # store as LangChain message
+    state["messages"].append(HumanMessage(content=state["user_query"]))
+    return {"messages": [HumanMessage(content=state["user_query"])]}
 
 
 def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
@@ -276,7 +373,9 @@ def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
     ]
     # Use timeout to prevent hanging (common with local models)
     try:
-        raw = _invoke_with_timeout(llm, messages)
+        raw_msg = _invoke_with_timeout(llm, messages)
+        raw = _as_text(raw_msg)
+        data = _try_parse_json(raw)
     except concurrent.futures.TimeoutError:
         state.setdefault("errors", []).append({
             "node": "route_guard",
@@ -289,8 +388,6 @@ def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | No
         state["command_args"] = {}
         return state
 
-    # Robust JSON parse
-    data = _try_parse_json(raw)
 
     if data is None:
         candidate = _extract_json_object(raw)
@@ -387,33 +484,32 @@ def write_answer(state: AgentState, llm: LLMProvider, config: RunnableConfig | N
         HumanMessage(content=f"Question: {state['user_query']}\n\nMATCH FACTS:\n{fact_block}"),
     ]
 
-    out = []
-    for tok in llm.stream(messages):
-        emit_token(config, tok)
-        out.append(tok)
+    out_text: list[str] = []
+    for chunk in llm.stream(messages):
+        # ✅ ChatOpenAI returns AIMessageChunk; Ollama wrappers may return str
+        piece = chunk if isinstance(chunk, str) else (getattr(chunk, "content", "") or "")
+        if not piece:
+            continue
+        emit_token(config, piece)   # emit plain string
+        out_text.append(piece)
 
-    state["final_answer"] = "".join(out).strip()
+    state["final_answer"] = "".join(out_text).strip()
 
-    # citations from fact source_url (dedupe)
-    urls = []
-    seen = set()
+    # citations from fact source_url
+    cites = []
     for f in facts_to_use:
         if not f:
             continue
         u = f.get("source_url")
-        if u and u not in seen:
-            seen.add(u)
-            urls.append(u)
-    state["citations"] = urls[:3]
-
-    state["awaiting_selection"] = False
-    state["pending_user_query"] = ""
+        if u:
+            cites.append(u)
+    state["citations"] = list(dict.fromkeys(cites))  # de-dupe, keep order
 
     return state
 
 
-# --------- Conditional routing helpers (pure functions) ----------
-def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "plan_search", "resolve_selection"]:
+
+def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "agent_search", "resolve_selection"]:
     r = state.get("route")
     if r == "COMMAND":
         if state.get("command") == "resolve_selection":
@@ -421,7 +517,7 @@ def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "
         return "handle_command"
     if r == "OUT_OF_SCOPE":
         return "refuse"
-    return "plan_search"
+    return "agent_search"
 
 
 def next_after_extract_Debug(state: AgentState) -> Literal["clarify_ambiguity", "write_answer"]:
@@ -569,14 +665,47 @@ def clarify_ambiguity(state: AgentState, config: RunnableConfig | None = None) -
     state["citations"] = []
     return state
 
+def _latest_tool_results_as_search_results(messages: list[Any]) -> list[dict[str, Any]]:
+    """
+    ToolNode returns ToolMessage(content=...) where content may be:
+    - a JSON string
+    - python-like repr
+    - already a list/dict depending on provider
+    We normalize to list[dict(title,url,snippet)].
+    """
+    if not messages:
+        return []
 
+    # scan from the end for ToolMessages (latest tool output)
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            content = m.content
+            if isinstance(content, list):
+                return content
+            if isinstance(content, dict):
+                return [content]
+            if isinstance(content, str):
+                # try JSON parse
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        return parsed
+                    if isinstance(parsed, dict):
+                        return [parsed]
+                except Exception:
+                    return []
+    return []
 
 
 def extract_facts(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Extracting match facts (structured)...")
 
+    # Prefer explicit search_results; else pull from latest tool output
     results = state.get("search_results") or []
-
+    if not results:
+        results = _latest_tool_results_as_search_results(state.get("messages") or [])
+        state["search_results"] = results
+    
     # Keep evidence smaller to reduce local-model JSON failures/hangs
     evidence_block = "\n".join(
         [f"- Title: {r['title']}\n  URL: {r['url']}\n  Snippet: {r['snippet']}" for r in results[:5]]
@@ -589,7 +718,8 @@ def extract_facts(state: AgentState, llm: LLMProvider, config: RunnableConfig | 
 
     # 0) Call model with timeout (prevents hangs on local models)
     try:
-        raw = _invoke_with_timeout(llm, messages)
+        msg = _invoke_with_timeout(llm, messages)
+        raw = msg.content if hasattr(msg, "content") else str(msg)
     except concurrent.futures.TimeoutError:
         state.setdefault("errors", []).append({
             "node": "extract_facts",
@@ -710,7 +840,8 @@ def resolve_selection(state: AgentState, llm: LLMProvider, config: RunnableConfi
     ]
 
     try:
-        raw = _invoke_with_timeout(llm, messages)
+        msg = _invoke_with_timeout(llm, messages)
+        raw = msg.content if hasattr(msg, "content") else str(msg)
     except concurrent.futures.TimeoutError:
         state["final_answer"] = "I couldn’t resolve your selection in time. Reply with 1/2/3…"
         state["awaiting_selection"] = True

@@ -3,14 +3,20 @@ import os
 import uuid
 from rich.console import Console
 
+from langchain_core.messages import AIMessageChunk
+from langgraph.checkpoint.postgres import PostgresSaver
+
 from app.llm.factory import get_llm
 from app.graph.build_graph import build_graph
 from app.state import AgentState
-from langgraph.checkpoint.postgres import PostgresSaver
 
 
 console = Console()
+
+VALID_COMMANDS = {"/undo", "/rewind", "/restart", "/history", "/threads", "/switch", "/new"}
 THREAD_CHECKPOINT: dict[str, str | None] = {}
+KNOWN_THREADS: set[str] = set()
+
 
 
 def get_latest_checkpoint_id(app, thread_id: str) -> str | None:
@@ -51,38 +57,39 @@ def make_emitter():
             console.print(evt.get("text", ""), end="")
     return emit
 
+
 def run_once(app, thread_id: str, user_query: str, checkpoint_id: str | None = None):
-    saw_token = False
-
-    def emit(event: dict):
-        nonlocal saw_token
-        t = event.get("type")
-        if t == "progress":
-            console.print(f"{event.get('message')}")
-        elif t == "token":
-            saw_token = True
-            console.print(event.get("text", ""), end="")
-
-    # Important: only send new input; checkpointer loads prior state
-    state: AgentState = {"user_query": user_query}
-
-    cfg = {"configurable": {"thread_id": thread_id, "emit": emit}}
+    cfg = {"configurable": {"thread_id": thread_id}}
     if checkpoint_id:
         cfg["configurable"]["checkpoint_id"] = checkpoint_id
 
-    result: AgentState = app.invoke(state, config=cfg)
+    input_state: AgentState = {"user_query": user_query}
 
-    if (not saw_token) and result.get("final_answer"):
-        console.print(result["final_answer"])
+    # stream_mode="messages" gives AIMessageChunk (and tool messages depending on model)
+    for msg, meta in app.stream(input_state, config=cfg, stream_mode="messages"):
+        if isinstance(msg, AIMessageChunk):
+            ak = msg.additional_kwargs or {}
+            reasoning = ak.get("reasoning") or ak.get("thinking")
+            if reasoning:
+                console.print(f"[dim]{reasoning}[/dim]")
 
-    cites = result.get("citations") or []
-    if (not saw_token) and cites:
-        console.print("\nSources:\n")
+            if msg.content:
+                console.print(msg.content, end="")
+
+    # newline after stream
+    console.print("")
+
+    # fetch final state snapshot (for citations/errors/checkpoint)
+    snap = app.get_state({"configurable": {"thread_id": thread_id}})
+    final_state = snap.values or {}
+
+    cites = final_state.get("citations") or []
+    if cites:
+        console.print("\nSources:")
         for u in cites[:3]:
             console.print(u)
-            console.print("\n")
 
-    return result
+    return final_state
 
 
 
@@ -98,10 +105,11 @@ def main():
         app = build_graph(llm, checkpointer=checkpointer)
 
         thread_id = str(uuid.uuid4())
+        KNOWN_THREADS.add(thread_id)
         THREAD_CHECKPOINT[thread_id] = None
         console.print(f"[dim]New thread_id: {thread_id}[/dim]")
         console.print("[bold green]Football Agent (Slice 3)[/bold green]")
-        console.print("Type a question. Commands: /undo N, /rewind ID, /restart. Type 'exit' to quit.\n")
+        console.print("Type a question. Commands: /history, /undo N, /rewind ID, /restart, /threads, /switch <id>, /new. Type 'exit' to quit.\n")
 
         while True:
             user_query = console.input("\n[bold]You:[/bold] ").strip()
@@ -110,12 +118,14 @@ def main():
             if user_query.lower() in ("exit", "quit"):
                 break
 
-            if user_query.startswith("/") and user_query.split()[0] not in ("/undo", "/rewind", "/restart", "/history"):
-                console.print("[yellow]Unknown command. Try /history, /undo N, /rewind ID, /restart[/yellow]")
+            if user_query.startswith("/") and user_query.split()[0] not in VALID_COMMANDS:
+                console.print("[yellow]Unknown command. Try /history, /undo N, /rewind ID, /restart, /threads, /switch <id>, /new[/yellow]")
                 continue
+
 
             if user_query.strip() == "/restart":
                 thread_id = str(uuid.uuid4())
+                KNOWN_THREADS.add(thread_id)
                 THREAD_CHECKPOINT[thread_id] = None
                 console.print(f"[bold yellow]New thread_id: {thread_id}[/bold yellow]")
                 continue
@@ -153,6 +163,33 @@ def main():
                     n = int(parts[1])
                 show_history(app, thread_id, limit=n)
                 continue
+            if user_query.strip() == "/threads":
+                console.print("[bold]Known threads:[/bold]")
+                for t in sorted(KNOWN_THREADS):
+                    mark = "*" if t == thread_id else " "
+                    console.print(f"{mark} {t}")
+                continue
+
+            if user_query.startswith("/switch"):
+                parts = user_query.split()
+                if len(parts) < 2:
+                    console.print("[yellow]Usage: /switch <thread_id>[/yellow]")
+                    continue
+                target = parts[1].strip()
+                if target not in KNOWN_THREADS:
+                    console.print("[yellow]Unknown thread_id. Use /threads to list.[/yellow]")
+                    continue
+                thread_id = target
+                console.print(f"[bold yellow]Switched to thread: {thread_id}[/bold yellow]")
+                continue
+
+            if user_query.strip() == "/new":
+                thread_id = str(uuid.uuid4())
+                KNOWN_THREADS.add(thread_id)
+                THREAD_CHECKPOINT[thread_id] = None
+                console.print(f"[bold yellow]New thread_id: {thread_id}[/bold yellow]")
+                continue
+
 
             ck = THREAD_CHECKPOINT.get(thread_id)
             result = run_once(app, thread_id, user_query, checkpoint_id=ck)

@@ -2,14 +2,23 @@ from __future__ import annotations
 from langgraph.graph import StateGraph, END
 from typing import Any
 
+from langgraph.prebuilt import ToolNode, tools_condition
+
+from app.tools.web_search_tool import web_search_tool
 from app.state import AgentState
 from app.llm.base import LLMProvider
 from app.graph import nodes as N
 
 
 
+
 def build_graph(llm: LLMProvider, checkpointer: Any = None):
     g = StateGraph(AgentState)
+
+    # ---- LLM with tools ----
+    chat = llm.get_chat_model()
+    llm_with_tools = chat.bind_tools([web_search_tool])
+
 
     # ---- LLM-wrapped nodes ----
     def route_guard_node(state: AgentState, config=None):
@@ -29,7 +38,12 @@ def build_graph(llm: LLMProvider, checkpointer: Any = None):
     
     def resolve_selection_node(state: AgentState, config=None):
         return N.resolve_selection(state, llm=llm, config=config)
+    
+    def agent_search_node(state: AgentState, config=None):
+        return N.agent_search(state, llm=llm_with_tools, config=config)
 
+
+    tool_node = ToolNode([web_search_tool])
 
     # ---- Nodes ----
     g.add_node("ingest_user", N.ingest_user)
@@ -37,6 +51,10 @@ def build_graph(llm: LLMProvider, checkpointer: Any = None):
 
     g.add_node("handle_command", N.handle_command)
     g.add_node("refuse", N.refuse)
+ 
+    g.add_node("agent_search", agent_search_node)
+    g.add_node("tools", tool_node)
+
 
     g.add_node("plan_search", plan_search_node)
     g.add_node("search_web", N.search_web)
@@ -53,6 +71,17 @@ def build_graph(llm: LLMProvider, checkpointer: Any = None):
     g.set_entry_point("ingest_user")
     g.add_edge("ingest_user", "route_guard")
 
+    # ✅ Built-in tools routing
+    g.add_conditional_edges("agent_search", 
+                            tools_condition, 
+                            {
+                                "tools": "tools", 
+                                "__end__": "extract_facts",
+                                "end": "extract_facts"
+                                }
+                            )
+    g.add_edge("tools", "agent_search")
+
     # ---- Route decision ----
     g.add_conditional_edges(
         "route_guard",
@@ -61,7 +90,7 @@ def build_graph(llm: LLMProvider, checkpointer: Any = None):
             "handle_command": "handle_command",
             "resolve_selection": "resolve_selection",
             "refuse": "refuse",
-            "plan_search": "plan_search",
+            "agent_search": "agent_search",
         },
     )
 

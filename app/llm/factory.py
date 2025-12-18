@@ -14,3 +14,5 @@ def get_llm() -> LLMProvider:
         return OllamaProvider(model=settings.ollama_model, base_url=settings.ollama_base_url)
 
     raise RuntimeError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
+
+
