@@ -1,12 +1,14 @@
 from __future__ import annotations
 from langgraph.graph import StateGraph, END
+from typing import Any
 
 from app.state import AgentState
 from app.llm.base import LLMProvider
 from app.graph import nodes as N
 
 
-def build_graph(llm: LLMProvider):
+
+def build_graph(llm: LLMProvider, checkpointer: Any = None):
     g = StateGraph(AgentState)
 
     # ---- LLM-wrapped nodes ----
@@ -105,4 +107,4 @@ def build_graph(llm: LLMProvider):
 
     g.add_edge("refuse", END)
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)

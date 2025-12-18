@@ -8,6 +8,8 @@ dependencies = [
   "pydantic>=2.7.0",
   "python-dotenv>=1.0.1",
   "rich>=13.7.0",
+  "psycopg[binary]>=3.2.0",
+  "langgraph-checkpoint-postgres>=3.0.2",
 
   # Providers (switchable)
   "langchain-openai>=0.2.0",

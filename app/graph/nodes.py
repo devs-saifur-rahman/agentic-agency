@@ -343,13 +343,13 @@ def handle_command(state: AgentState, config: RunnableConfig | None = None) -> A
 
     # Slice 1: only confirm (real undo/rewind comes with Postgres checkpointing in a later slice)
     if cmd == "UNDO":
-        state["final_answer"] = f"✅ Command received: UNDO last {args.get('n', 1)} message(s). (Will be implemented with Postgres checkpoints in Slice 4.)"
+        state["final_answer"] = f"✅ Command received: UNDO last {args.get('n', 1)} message(s). )"
         return state
     if cmd == "REWIND":
-        state["final_answer"] = f"✅ Command received: REWIND to checkpoint '{args.get('checkpoint_id')}'. (Will be implemented with Postgres checkpoints in Slice 4.)"
+        state["final_answer"] = f"✅ Command received: REWIND to checkpoint '{args.get('checkpoint_id')}'. "
         return state
     if cmd == "RESTART":
-        state["final_answer"] = "✅ Command received: RESTART. (Will be implemented with new thread_id + Postgres checkpoints in Slice 4.)"
+        state["final_answer"] = "✅ Command received: RESTART. "
         return state
 
     state["final_answer"] = "⚠️ Unknown command."
@@ -407,7 +407,7 @@ def write_answer(state: AgentState, llm: LLMProvider, config: RunnableConfig | N
     state["citations"] = urls[:3]
 
     state["awaiting_selection"] = False
-    state["pending_user_query"] = None
+    state["pending_user_query"] = ""
 
     return state
 
