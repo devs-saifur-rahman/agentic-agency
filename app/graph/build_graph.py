@@ -24,6 +24,10 @@ def build_graph(llm: LLMProvider):
 
     def write_answer_node(state: AgentState, config=None):
         return N.write_answer(state, llm=llm, config=config)
+    
+    def resolve_selection_node(state: AgentState, config=None):
+        return N.resolve_selection(state, llm=llm, config=config)
+
 
     # ---- Nodes ----
     g.add_node("ingest_user", N.ingest_user)
@@ -35,6 +39,8 @@ def build_graph(llm: LLMProvider):
     g.add_node("plan_search", plan_search_node)
     g.add_node("search_web", N.search_web)
     g.add_node("reformulate_search", reformulate_search_node)
+
+    g.add_node("resolve_selection", resolve_selection_node)
 
     g.add_node("extract_facts", extract_facts_node)
     g.add_node("clarify_ambiguity", N.clarify_ambiguity)
@@ -51,6 +57,7 @@ def build_graph(llm: LLMProvider):
         N.next_after_route,
         {
             "handle_command": "handle_command",
+            "resolve_selection": "resolve_selection",
             "refuse": "refuse",
             "plan_search": "plan_search",
         },
@@ -85,8 +92,17 @@ def build_graph(llm: LLMProvider):
     g.add_edge("clarify_ambiguity", END)
     g.add_edge("write_answer", END)
 
+    g.add_edge("resolve_selection", "write_answer")
+
     # ---- Terminal paths ----
-    g.add_edge("handle_command", END)
+    g.add_node("done", lambda s, config=None: s)
+    g.add_edge("done", END)
+    g.add_conditional_edges(
+        "handle_command",
+        N.next_after_command,
+        {"write_answer": "write_answer", "end": "done"},
+    )
+
     g.add_edge("refuse", END)
 
     return g.compile()

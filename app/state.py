@@ -35,3 +35,7 @@ class AgentState(TypedDict, total=False):
     confidence: Literal["low", "medium", "high"]
     missing_fields: list[str]
     selected_fact: dict[str, Any] | None
+    
+    # ---- Clarification / Selection ----
+    awaiting_selection: bool
+    pending_user_query: str

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Literal, Optional
 import concurrent.futures
@@ -64,6 +65,30 @@ def _invoke_with_timeout(llm: LLMProvider, messages, timeout_s: int = DEFAULT_LL
         # Don't wait for a stuck thread
         fut.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
+
+
+def _parse_selection_index(text: str) -> int | None:
+    """0-based index for inputs like '2', '2.', 'option 2'. None if not a selection."""
+    if not text:
+        return None
+    t = text.strip().lower()
+
+    if t.isdigit():
+        n = int(t)
+        return n - 1 if n >= 1 else None
+
+    m = re.match(r"^\s*(\d+)\s*[\.\)]\s*$", t)
+    if m:
+        n = int(m.group(1))
+        return n - 1 if n >= 1 else None
+
+    m = re.search(r"\b(option|pick|choose|select)\s+(\d+)\b", t)
+    if m:
+        n = int(m.group(2))
+        return n - 1 if n >= 1 else None
+
+    return None
+
 
 # ---------- Event emission (progress + token streaming) ----------
 def emit_progress(config: RunnableConfig | None, msg: str) -> None:
@@ -213,6 +238,13 @@ def ingest_user(state: AgentState, config: RunnableConfig | None = None) -> Agen
 def route_guard(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
     emit_progress(config, "Routing request (scope/command detection)...")
     user_text = state["user_query"].strip()
+
+    # If we are awaiting a selection, route to resolve_selection (numeric OR text)
+    if state.get("awaiting_selection") is True and (state.get("extracted_facts") or []):
+        state["route"] = "COMMAND"
+        state["command"] = "resolve_selection"
+        state["command_args"] = {"selection_text": user_text}
+        return state
 
     # Fast-path deterministic parsing for commands (no LLM needed)
     if user_text.startswith("/"):
@@ -374,17 +406,23 @@ def write_answer(state: AgentState, llm: LLMProvider, config: RunnableConfig | N
             urls.append(u)
     state["citations"] = urls[:3]
 
+    state["awaiting_selection"] = False
+    state["pending_user_query"] = None
+
     return state
 
 
 # --------- Conditional routing helpers (pure functions) ----------
-def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "plan_search"]:
+def next_after_route(state: AgentState) -> Literal["handle_command", "refuse", "plan_search", "resolve_selection"]:
     r = state.get("route")
     if r == "COMMAND":
+        if state.get("command") == "resolve_selection":
+            return "resolve_selection"
         return "handle_command"
     if r == "OUT_OF_SCOPE":
         return "refuse"
     return "plan_search"
+
 
 def next_after_extract_Debug(state: AgentState) -> Literal["clarify_ambiguity", "write_answer"]:
     nxt = "write_answer"
@@ -524,9 +562,13 @@ def clarify_ambiguity(state: AgentState, config: RunnableConfig | None = None) -
         "Which one do you mean? Reply with 1/2/3… or tell me the date/competition.\n\n"
         + ("\n".join(lines) if lines else "No clear candidates were extracted; please specify date/competition/opponent.")
     )
+
+    state["pending_user_query"] = state.get("user_query", "")
+    state["awaiting_selection"] = True
     state["final_answer"] = prompt
     state["citations"] = []
     return state
+
 
 
 
@@ -612,3 +654,120 @@ def extract_facts(state: AgentState, llm: LLMProvider, config: RunnableConfig | 
         state["missing_fields"] = ["score", "teams", "date"]
         state["selected_fact"] = None
         return state
+
+SELECTION_SYSTEM = """
+You are selecting which match candidate the user means.
+Return ONLY valid JSON: {"selected_index": <int or null>}.
+
+Rules:
+- Use the candidates ONLY (no external knowledge).
+- If the user clearly refers to one candidate by opponent/competition/date/score -> select it.
+- If unclear -> selected_index must be null.
+"""
+
+class SelectionDecision(BaseModel):
+    selected_index: int | None = None
+
+
+def resolve_selection(state: AgentState, llm: LLMProvider, config: RunnableConfig | None = None) -> AgentState:
+    emit_progress(config, "Resolving selection (numeric/text)...")
+
+    text = (state.get("command_args") or {}).get("selection_text", "") or ""
+    facts = state.get("extracted_facts") or []
+
+    # 1) Deterministic numeric selection
+    idx = _parse_selection_index(text)
+    if idx is not None:
+        if 0 <= idx < len(facts):
+            state["selected_fact"] = facts[idx]
+            state["ambiguous"] = False
+            state["confidence"] = "high"
+            state["awaiting_selection"] = False
+            # restore original question
+            oq = (state.get("pending_user_query") or "").strip()
+            if oq:
+                state["user_query"] = oq
+            # next: write_answer
+            state["command"] = "select_fact"
+            state["final_answer"] = None
+            return state
+
+        state["final_answer"] = "That selection is out of range. Reply with 1/2/3…"
+        state["awaiting_selection"] = True
+        return state
+
+    # 2) Text-based selection using LLM over candidates (no web)
+    options = []
+    for i, f in enumerate(facts):
+        options.append(
+            f"{i+1}) {f.get('home_team')} vs {f.get('away_team')} — {f.get('score')} — {f.get('competition')} — {f.get('date')}"
+        )
+    options_block = "\n".join(options)
+
+    messages = [
+        SystemMessage(content=SELECTION_SYSTEM),
+        HumanMessage(content=f"User reply: {text}\n\nCandidates:\n{options_block}\n\nReturn JSON only."),
+    ]
+
+    try:
+        raw = _invoke_with_timeout(llm, messages)
+    except concurrent.futures.TimeoutError:
+        state["final_answer"] = "I couldn’t resolve your selection in time. Reply with 1/2/3…"
+        state["awaiting_selection"] = True
+        return state
+
+    data = _try_parse_json(raw)
+    if data is None:
+        cand = _extract_json_object(raw)
+        if cand:
+            data = _try_parse_json(cand)
+    if data is None:
+        # one repair attempt
+        try:
+            repaired = _repair_json_with_llm(raw, llm)
+            data = _try_parse_json(repaired) or _try_parse_json(_extract_json_object(repaired) or "")
+        except Exception:
+            data = None
+
+    try:
+        if data is None:
+            raise json.JSONDecodeError("Could not parse JSON", raw, 0)
+        decision = SelectionDecision.model_validate(data)
+    except Exception:
+        state["final_answer"] = "I couldn't understand your choice. Reply with 1/2/3… or mention opponent/date/competition."
+        state["awaiting_selection"] = True
+        return state
+
+    if decision.selected_index is None:
+        state["final_answer"] = "I’m not sure which one you mean. Reply with 1/2/3… or mention opponent/date/competition."
+        state["awaiting_selection"] = True
+        return state
+
+    if not (0 <= decision.selected_index < len(facts)):
+        state["final_answer"] = "That selection is out of range. Reply with 1/2/3…"
+        state["awaiting_selection"] = True
+        return state
+
+    state["selected_fact"] = facts[decision.selected_index]
+    state["ambiguous"] = False
+    state["confidence"] = "high"
+    state["awaiting_selection"] = False
+
+    oq = (state.get("pending_user_query") or "").strip()
+    if oq:
+        state["user_query"] = oq
+
+    state["command"] = "select_fact"  # for graph routing
+    state["final_answer"] = None
+    return state
+
+
+def next_after_command(state: AgentState) -> Literal["write_answer", "end"]:
+    # After resolve_selection, we set command=select_fact when ready to answer
+    if state.get("command") == "select_fact" and state.get("selected_fact") is not None:
+        return "write_answer"
+    return "end"
+
+
+
+
